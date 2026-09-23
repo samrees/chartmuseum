@@ -601,6 +601,12 @@ func (server *MultiTenantServer) rebuildIndexForTenant(repo string) {
 }
 
 func (server *MultiTenantServer) refreshCacheEntry(log cm_logger.LoggingFn, repo string, entry *cacheEntry) {
+	// Serialize the storage scan with cache events. If an upload happens while
+	// ListObjects is in progress, its event must be applied after the scan or
+	// the stale listing can incorrectly remove the newly uploaded chart.
+	entry.RepoLock.Lock()
+	defer entry.RepoLock.Unlock()
+
 	fo := <-server.getChartList(log, repo)
 
 	if fo.err != nil {
@@ -624,9 +630,6 @@ func (server *MultiTenantServer) refreshCacheEntry(log cm_logger.LoggingFn, repo
 	log(cm_logger.DebugLevel, "Change detected between cache and storage",
 		"repo", repo,
 	)
-
-	entry.RepoLock.Lock()
-	defer entry.RepoLock.Unlock()
 
 	ir := <-server.regenerateRepositoryIndex(log, entry, diff)
 	if ir.err != nil {
