@@ -58,6 +58,12 @@ type (
 		RepoName  string         `json:"a"`
 		RepoIndex *cm_repo.Index `json:"b"`
 		RepoLock  sync.RWMutex
+
+		// Serialize background refreshes without blocking index readers or events
+		// during storage listings. refreshChanges is protected by RepoLock and
+		// exists only while a refresh is in progress (including deletion tombstones).
+		refreshLock    sync.Mutex
+		refreshChanges map[string]struct{}
 	}
 
 	memoryCacheStore struct {
@@ -147,6 +153,13 @@ func (server *MultiTenantServer) regenerateRepositoryIndex(log cm_logger.Logging
 
 func (server *MultiTenantServer) regenerateRepositoryIndexWorker(log cm_logger.LoggingFn, entry *cacheEntry, diff cm_storage.ObjectSliceDiff) (*cm_repo.Index, error) {
 	repo := entry.RepoName
+	// Callers hold RepoLock. Foreground regeneration can overlap a background
+	// listing; preserve its changes just as we preserve upload/delete events.
+	for _, objects := range [][]cm_storage.Object{diff.Added, diff.Updated, diff.Removed} {
+		for _, object := range objects {
+			entry.recordRefreshChange(object.Path)
+		}
+	}
 
 	log(cm_logger.DebugLevel, "Regenerating index.yaml",
 		"repo", repo,
@@ -518,10 +531,6 @@ func (server *MultiTenantServer) startEventListener() {
 			log(cm_logger.ErrorLevel, "Error initializing cache entry", zap.Error(err), zap.String("repo", repo))
 			continue
 		}
-		entry.RepoLock.RLock()
-		index := entry.RepoIndex
-		entry.RepoLock.RUnlock()
-
 		server.TenantCacheKeyLock.Lock()
 		_, ok := server.Tenants[e.RepoName]
 		server.TenantCacheKeyLock.Unlock()
@@ -537,40 +546,51 @@ func (server *MultiTenantServer) startEventListener() {
 			continue
 		}
 
-		entry.RepoLock.Lock()
-		switch e.OpType {
-		case updateChart:
-			index.UpdateEntry(e.ChartVersion)
-		case addChart:
-			index.AddEntry(e.ChartVersion)
-		case deleteChart:
-			index.RemoveEntry(e.ChartVersion)
-		default:
-			log(cm_logger.ErrorLevel, "Invalid operation type", zap.String("repo", repo),
-				"operation_type", e.OpType)
-			continue
-		}
-
-		err = index.Regenerate()
+		err = server.applyCacheEvent(log, entry, e)
 		if err != nil {
-			log(cm_logger.ErrorLevel, "Error regenerating index", zap.Error(err), zap.String("repo", repo))
+			log(cm_logger.ErrorLevel, "Error applying cache event", zap.Error(err), zap.String("repo", repo))
 			continue
-		}
-		entry.RepoIndex = index
-		entry.RepoLock.Unlock()
-		err = server.saveCacheEntry(log, entry)
-		if err != nil {
-			log(cm_logger.ErrorLevel, "Error saving cache entry", zap.Error(err), zap.String("repo", repo))
-			continue
-		}
-
-		if server.UseStatefiles {
-			// Dont wait, save index-cache.yaml to storage in the background.
-			// It is not crucial if this does not succeed, we will just log any errors
-			go server.saveStatefile(log, e.RepoName, entry.RepoIndex.Raw)
 		}
 
 		log(cm_logger.DebugLevel, "Event handled successfully", zap.Any("event", e))
+	}
+}
+
+func (server *MultiTenantServer) applyCacheEvent(log cm_logger.LoggingFn, entry *cacheEntry, e event) error {
+	entry.RepoLock.Lock()
+	defer entry.RepoLock.Unlock()
+
+	// Read the current index only after acquiring the write lock: a refresh
+	// may have replaced it while this event was waiting.
+	index := entry.RepoIndex
+	switch e.OpType {
+	case updateChart:
+		index.UpdateEntry(e.ChartVersion)
+	case addChart:
+		index.AddEntry(e.ChartVersion)
+	case deleteChart:
+		index.RemoveEntry(e.ChartVersion)
+	default:
+		return errors.New("invalid operation type")
+	}
+	entry.recordRefreshChange(cm_repo.ChartPackageFilenameFromNameVersion(e.ChartVersion.Name, e.ChartVersion.Version))
+	if err := index.Regenerate(); err != nil {
+		return err
+	}
+	if err := server.saveCacheEntry(log, entry); err != nil {
+		return err
+	}
+	if server.UseStatefiles {
+		go server.saveStatefile(log, e.RepoName, index.Raw)
+	}
+	return nil
+}
+
+// recordRefreshChange requires RepoLock. Retain deletions even when the chart
+// is no longer in the index, so a stale listing cannot resurrect it.
+func (entry *cacheEntry) recordRefreshChange(path string) {
+	if entry.refreshChanges != nil {
+		entry.refreshChanges[path] = struct{}{}
 	}
 }
 
@@ -601,23 +621,41 @@ func (server *MultiTenantServer) rebuildIndexForTenant(repo string) {
 }
 
 func (server *MultiTenantServer) refreshCacheEntry(log cm_logger.LoggingFn, repo string, entry *cacheEntry) {
-	// Serialize the storage scan with cache events. If an upload happens while
-	// ListObjects is in progress, its event must be applied after the scan or
-	// the stale listing can incorrectly remove the newly uploaded chart.
+	entry.refreshLock.Lock()
+	defer entry.refreshLock.Unlock()
+
+	entry.RepoLock.Lock()
+	entry.refreshChanges = make(map[string]struct{})
+	entry.RepoLock.Unlock()
+
+	// Start a fresh listing after tracking mutations. Joining a getChartList
+	// request that started earlier could miss mutations preceding this refresh.
+	objectsInStorage, err := server.fetchChartsInStorage(log, repo)
+
 	entry.RepoLock.Lock()
 	defer entry.RepoLock.Unlock()
+	defer func() { entry.refreshChanges = nil }()
 
-	fo := <-server.getChartList(log, repo)
-
-	if fo.err != nil {
-		errStr := fo.err.Error()
+	if err != nil {
+		errStr := err.Error()
 		log(cm_logger.ErrorLevel, errStr,
 			"repo", repo,
 		)
 		return
 	}
-	objects := server.getRepoObjectSliceWithLock(entry)
-	diff := cm_storage.GetObjectSliceDiff(objects, fo.objects, server.TimestampTolerance)
+	objects := server.getRepoObjectSlice(entry)
+	// Exclude touched paths on both sides: the current index is authoritative
+	// for those charts, regardless of what the older storage listing contains.
+	unchanged := func(objects []cm_storage.Object) []cm_storage.Object {
+		filtered := objects[:0]
+		for _, object := range objects {
+			if _, changed := entry.refreshChanges[object.Path]; !changed {
+				filtered = append(filtered, object)
+			}
+		}
+		return filtered
+	}
+	diff := cm_storage.GetObjectSliceDiff(unchanged(objects), unchanged(objectsInStorage), server.TimestampTolerance)
 
 	// return fast if no changes
 	if !diff.Change {
